@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create the Glue Database and Crawler to make a queryable CloudTrail Logs table for Athena
+
+Parameters: 
+  OrganizationId:
+    Type: String
+    Description: The Organization Id of your organization (omit if you are not using an Org CloudTrail)
+  CloudTrailS3BucketName:
+    Type: String
+    Description: The name of the bucket containing your CloudTrail logs
+  CodeS3BucketName:
+    Type: String
+    Description: The name of the bucket containing the Glue code, it needs to have a folder named "python" in which the .py file was uploaded
+  CloudtrailDataLakeS3: 
+    Type: String
+    Description: This bucket is used by the optional Glue job which creates a folder "data-lake" to store the data in optimized Parquet format
+
+Resources:
+
+  # We create a DynamoDB table to hold the partitions location that have been already processed
+  DDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "cloudtrail_partitions"
+      AttributeDefinitions:
+        -
+          AttributeName: "s3_path"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "s3_path"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+    
+  CloudTrailGlueExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  GluePolicy:
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - s3:GetBucketLocation
+          - s3:GetObject
+          - s3:PutObject
+          - s3:ListBucket
+          Effect: Allow
+          Resource:
+          - !Join ['', ['arn:aws:s3:::', !Ref CloudTrailS3BucketName] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CloudTrailS3BucketName, '/*'] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CloudtrailDataLakeS3] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CloudtrailDataLakeS3, '/*'] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CodeS3BucketName] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CodeS3BucketName, '/*'] ]
+        - Action:
+          - s3:DeleteObject
+          Effect: Allow
+          Resource:
+          - !Join ['', ['arn:aws:s3:::', !Ref CloudtrailDataLakeS3] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CloudtrailDataLakeS3, '/*'] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CodeS3BucketName] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref CodeS3BucketName, '/*'] ]
+        - Action:
+          - dynamodb:BatchGetItem
+          - dynamodb:BatchWriteItem
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          - dynamodb:Scan
+          - dynamodb:Query
+          - dynamodb:UpdateItem
+          - dynamodb:GetRecords
+          Effect: Allow
+          Resource: 
+          #arn:aws:dynamodb:ca-central-1:923244282814:table/cloudtrail_partitions
+            - !Join ['', ['arn:aws:dynamodb:', !Ref "AWS::Region" , ':' , !Ref "AWS::AccountId" , ':table/' , !Ref DDBTable ] ]
+      PolicyName: glue_cloudtrail_S3_policy
+      Roles:
+      - Ref: CloudTrailGlueExecutionRole
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - DDBTable
+
+  GlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties: 
+      Description: Workflow to crawl the cloudtrail logs
+      Name: cloudtrail_add_partition_workflow
+
+  GlueDatabaseCloudTrail:
+    Type: AWS::Glue::Database
+    Properties:
+      # The database is created in the Data Catalog for your account
+      CatalogId: !Ref AWS::AccountId   
+      DatabaseInput:
+        # The name of the database is defined in the Parameters section above
+        Name: cloudtrail_db
+        Description: Database to hold tables for Cloudtrail logs
+        LocationUri: !Ref CloudtrailDataLakeS3
+  
+
+# We create the Glue table through the Glue Data catalog
+  CloudTrailLogsGlueTable:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseName: !Ref GlueDatabaseCloudTrail
+      TableInput: 
+        Name: cloudtrail_logs
+        TableType: EXTERNAL_TABLE
+        Parameters: { 
+          "EXTERNAL": "TRUE",
+          "classification": "cloudtrail",
+          "jsonPath":"$.Records[*]",
+          "compressionType":"gzip",
+          "typeOfData":"file"
+        }
+        PartitionKeys: 
+          - Name: account
+            Type: string
+          - Name: region
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        StorageDescriptor: 
+          InputFormat: "com.amazon.emr.cloudtrail.CloudTrailInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          SerdeInfo:
+            SerializationLibrary: "com.amazon.emr.hive.serde.CloudTrailSerde"
+            Parameters: {
+              "serialization.format": "1"
+            }
+          StoredAsSubDirectories: true
+          Location: 
+            Fn::Join: 
+              - ""
+              - - "s3://"
+                - !Ref "CloudTrailS3BucketName"
+                - "/"
+                - !Ref OrganizationId
+                - "/AWSLogs/"
+          Columns:
+            -
+              Name: useridentity
+              Type: "struct<type:string,principalid:string,arn:string,accountid:string,invokedby:string,accesskeyid:string,username:string,sessioncontext:struct<attributes:struct<mfaauthenticated:string,creationdate:string>,sessionissuer:struct<type:string,principalid:string,arn:string,accountid:string,username:string>>>"
+            -
+              Name: eventversion
+              Type: string
+            -
+              Name: eventtime
+              Type: string
+            -
+              Name: eventtype
+              Type: string
+            -
+              Name: eventsource
+              Type: string
+            -
+              Name: eventname
+              Type: string
+            -
+              Name: awsregion
+              Type: string
+            -
+              Name: sourceipaddress
+              Type: string
+            -
+              Name: useragent
+              Type: string
+            -
+              Name: errorcode
+              Type: string
+            -
+              Name: errormessage
+              Type: string
+            -
+              Name: requestparameters
+              Type: string
+            -
+              Name: responseelements
+              Type: string
+            -
+              Name: additionaleventdata
+              Type: string
+            -
+              Name: requestid
+              Type: string
+            -
+              Name: eventid
+              Type: string
+            -
+              Name: resources
+              Type: "array<struct<arn:string,accountid:string,type:string>>"
+            -
+              Name: apiversion
+              Type: string
+            -
+              Name: readonly
+              Type: string
+            -
+              Name: recipientaccountid
+              Type: string
+            -
+              Name: serviceeventdetails
+              Type: string
+            -
+              Name: sharedeventid
+              Type: string
+            -
+              Name: vpcendpointid
+              Type: string
+  
+
+  GlueJobCreatePartitions:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: ct_glue_add_partitions
+      Role:
+        Fn::GetAtt: [CloudTrailGlueExecutionRole, Arn]
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxCapacity: 1
+      GlueVersion: 1.0
+      Command:
+        Name: pythonshell
+        PythonVersion: 3
+        ScriptLocation: !Sub
+          - s3://${bucket}/python/ct_glue_add_partitions.py
+          - {bucket: !Ref CodeS3BucketName}
+      DefaultArguments:
+        '--TempDir': !Sub
+          - s3://${bucket}/glue_tmp/
+          - {bucket: !Ref CodeS3BucketName}
+        "--job-bookmark-option" : "job-bookmark-disable"
+        "--initial-load" : "n"
+        "--s3bucket" : !Ref CloudTrailS3BucketName
+        "--s3path" : !Sub
+            - ${org}/AWSLogs/
+            - {org: !Ref OrganizationId}
+        "--years" : "2019,2020"
+        "--enable-metrics" : ""
+    DependsOn:
+      - CloudTrailGlueExecutionRole
+  
+  GlueJobCTtoParquet:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: ct_glue_to_parquet
+      Role:
+        Fn::GetAtt: [CloudTrailGlueExecutionRole, Arn]
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      AllocatedCapacity: 10
+      GlueVersion: 1.0
+      Command:
+        Name: glueetl
+        PythonVersion: 3
+        ScriptLocation: !Sub
+          - s3://${bucket}/python/ct_glue_to_parquet.py
+          - {bucket: !Ref CodeS3BucketName}
+      DefaultArguments:
+        '--TempDir': !Sub
+          - s3://${bucket}/glue_tmp/
+          - {bucket: !Ref CodeS3BucketName}
+        "--job-bookmark-option" : "job-bookmark-disable"
+        "--target_path" : !Sub
+            - s3://${bucket}/AWSLogs/
+            - {bucket: !Ref CloudtrailDataLakeS3}
+        "--db" : !Ref GlueDatabaseCloudTrail
+        "--table" : !Ref CloudTrailLogsGlueTable
+        "--enable-metrics" : ""
+    DependsOn:
+      - CloudTrailGlueExecutionRole
+
+  GlueJobTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: ct_add_partition_Job_Trigger
+      Type: SCHEDULED
+      Schedule: cron(15 12 * * ? *)
+      Description: Job trigger
+      WorkflowName: !Ref GlueWorkflow
+      StartOnCreation: 'true'
+      Actions:
+      - JobName: !Ref GlueJobCreatePartitions
+    DependsOn:
+      - GlueJobCreatePartitions
+  
+Outputs:
+  GlueDatabaseCloudTrail:
+    Description: AWS Glue Catalog Database Name
+    Value: !Ref GlueDatabaseCloudTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseCloudTrail'
